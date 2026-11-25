@@ -34,12 +34,13 @@ export default function Scans() {
       {msg && <div className="msg">{msg}</div>}
       {err && <div className="err">{err}</div>}
       <table>
-        <thead><tr><th>编号</th><th>条码</th><th>目的地</th><th>状态</th><th>口门</th><th>操作</th></tr></thead>
+        <thead><tr><th>编号</th><th>条码</th><th>目的地</th><th>状态</th><th>口门</th><th>袋</th><th>原袋</th><th>回流批次</th><th>操作</th></tr></thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.id}>
               <td>{r.id}</td><td>{r.barcode}</td><td>{r.dest_code}</td><td>{r.status}</td><td>{r.chute_id || '-'}</td>
-              <td>{(r.status === '待路由' || r.status === '错分回流') && <button type="button" onClick={() => routeOne(r.id)}>路由</button>}</td>
+              <td>{r.当前袋码 || '-'}</td><td>{r.原袋码 || '-'}</td><td>{r.回流批次码 || '-'}</td>
+              <td>{(r.status === '待路由' || r.status === '错分回流') && <button type="button" onClick={() => routeOne(r.id)}>{r.status === '错分回流' ? '再裁决' : '路由'}</button>}</td>
             </tr>
           ))}
         </tbody>

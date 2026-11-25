@@ -19,12 +19,20 @@ export default function Shifts() {
       <h2>班次对账</h2>
       {err && <div className="err">{err}</div>}
       {rec && (
-        <div className="grid">
-          <div className="stat"><div className="n">{rec.扫描总数}</div><div className="l">扫描总数</div></div>
-          <div className="stat"><div className="n">{rec.已路由及以上}</div><div className="l">已路由及以上</div></div>
-          <div className="stat"><div className="n">{rec.已封袋数}</div><div className="l">已封袋数</div></div>
-          <div className="stat"><div className="n">{rec.未清件数}</div><div className="l">未清件数</div></div>
-        </div>
+        <>
+          <p className={rec.一致 ? 'msg' : 'err'}>
+            {rec.一致 ? '对账一致' : `对账违规：${JSON.stringify(rec.违规)}`}
+          </p>
+          <div className="grid">
+            <div className="stat"><div className="n">{rec.扫描总数}</div><div className="l">扫描总数</div></div>
+            <div className="stat"><div className="n">{rec.已路由及以上}</div><div className="l">已路由及以上</div></div>
+            <div className="stat"><div className="n">{rec.已封袋数}</div><div className="l">已封袋数</div></div>
+            <div className="stat"><div className="n">{rec.回流承接袋数}</div><div className="l">回流承接袋数</div></div>
+            <div className="stat"><div className="n">{rec.已封袋件数}</div><div className="l">已封袋件数</div></div>
+            <div className="stat"><div className="n">{rec.回流进行中}</div><div className="l">回流进行中</div></div>
+            <div className="stat"><div className="n">{rec.未清件数}</div><div className="l">未清件数</div></div>
+          </div>
+        </>
       )}
       <table>
         <thead><tr><th>编号</th><th>营业日</th><th>班次</th><th>封班</th><th>操作</th></tr></thead>

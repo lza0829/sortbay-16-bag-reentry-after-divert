@@ -1,7 +1,6 @@
 from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
-from app.config import DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS lines (
@@ -44,6 +43,7 @@ CREATE TABLE IF NOT EXISTS scans (
   chute_id INTEGER,
   bag_id INTEGER,
   divert_batch_id INTEGER,
+  origin_bag_id INTEGER,
   scanned_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(shift_id) REFERENCES shifts(id),
@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS divert_batches (
   shift_id INTEGER NOT NULL,
   code TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT '回流中',
+  rebag_bag_id INTEGER,
+  settled_at TEXT,
   created_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(shift_id) REFERENCES shifts(id)
@@ -75,10 +77,25 @@ CREATE TABLE IF NOT EXISTS bags (
   chute_id INTEGER NOT NULL,
   code TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL DEFAULT '集包中',
+  kind TEXT NOT NULL DEFAULT '常规',
+  divert_batch_id INTEGER,
+  parent_bag_id INTEGER,
+  sealed_count INTEGER NOT NULL DEFAULT 0,
   sealed_at TEXT,
   note TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(shift_id) REFERENCES shifts(id),
   FOREIGN KEY(chute_id) REFERENCES chutes(id)
+);
+CREATE TABLE IF NOT EXISTS bag_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bag_id INTEGER NOT NULL,
+  scan_id INTEGER,
+  action TEXT NOT NULL,
+  from_bag_id INTEGER,
+  to_bag_id INTEGER,
+  divert_batch_id INTEGER,
+  created_at TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,31 +111,59 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
+# 老库补列（只增不改）。承接口径固定为「强制新开袋」。
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "scans": {"origin_bag_id": "INTEGER"},
+    "divert_batches": {"rebag_bag_id": "INTEGER", "settled_at": "TEXT"},
+    "bags": {
+        "kind": "TEXT NOT NULL DEFAULT '常规'",
+        "divert_batch_id": "INTEGER",
+        "parent_bag_id": "INTEGER",
+        "sealed_count": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
 
 def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    from app.config import db_path
+
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # isolation_level=None => 自动提交，事务由 db(immediate=True) 显式 BEGIN IMMEDIATE 控制
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=15, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
 @contextmanager
-def db():
+def db(immediate: bool = False):
+    """immediate=True 时用 BEGIN IMMEDIATE 串行化写口，杜绝回流/封口并发双终态。"""
     conn = connect()
     try:
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
-        conn.commit()
+        if immediate:
+            conn.execute("COMMIT")
     except Exception:
-        conn.rollback()
+        if immediate:
+            conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
 
 
 def init_db() -> None:
+    # executescript 会隐式提交，故不复用 BEGIN IMMEDIATE；DDL 均为幂等。
     with db() as conn:
         conn.executescript(SCHEMA)
+        for table, cols in MIGRATIONS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in cols.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

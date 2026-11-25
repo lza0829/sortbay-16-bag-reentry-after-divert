@@ -1,8 +1,10 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from app.db import db, rows_to_list, row_to_dict
-from app.services.common import audit, current_shift, now_str, require_unsealed
+from pydantic import BaseModel
+
+from app.db import db, rows_to_list
+from app.services import bagging
+from app.services.common import current_shift, require_unsealed
 
 router = APIRouter(tags=["封袋"])
 
@@ -22,78 +24,58 @@ def list_bags():
         return rows_to_list(conn.execute(
             """
             SELECT b.*, c.code AS 口门码,
-              (SELECT COUNT(*) FROM scans s WHERE s.bag_id=b.id) AS 件数
+              (SELECT COUNT(*) FROM scans s WHERE s.bag_id=b.id) AS 件数,
+              b.parent_bag_id AS 原袋编号,
+              (SELECT code FROM bags p WHERE p.id=b.parent_bag_id) AS 原袋码,
+              (SELECT code FROM divert_batches d WHERE d.id=b.divert_batch_id) AS 回流批次码
             FROM bags b JOIN chutes c ON c.id=b.chute_id
-            ORDER BY b.id DESC LIMIT 100
+            ORDER BY b.id DESC LIMIT 200
             """
         ).fetchall())
 
 
 @router.post("/封袋/开袋")
 def open_bag(body: BagOpenIn):
-    with db() as conn:
+    with db(immediate=True) as conn:
         require_unsealed(conn)
         shift = current_shift(conn)
         chute = conn.execute("SELECT * FROM chutes WHERE id=?", (body.口门编号,)).fetchone()
         if not chute:
             raise HTTPException(404, "口门不存在")
-        code = f"袋-{chute['code']}-{shift['id']}-{int(now_str()[-2:])}{shift['id']}"
-        # unique-ish
-        code = f"袋-{chute['code']}-{shift['id']}-{now_str().replace(':','').replace(' ', '')[-10:]}"
-        conn.execute(
-            "INSERT INTO bags(shift_id, chute_id, code, status, note) VALUES (?, ?, ?, '集包中', ?)",
-            (shift["id"], body.口门编号, code, body.备注),
+        return bagging.open_bag(
+            conn, chute=dict(chute), shift_id=shift["id"], note=body.备注,
         )
-        row = conn.execute("SELECT * FROM bags WHERE code=?", (code,)).fetchone()
-        audit(conn, "封袋", row["id"], "开袋", code)
-        return row_to_dict(row)
 
 
 @router.post("/封袋/{bag_id}/入袋")
 def add_to_bag(bag_id: int, body: BagAddIn):
-    with db() as conn:
+    with db(immediate=True) as conn:
         require_unsealed(conn)
-        bag = conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone()
-        if not bag:
-            raise HTTPException(404, "袋不存在")
-        if bag["status"] != "集包中":
-            raise HTTPException(400, "袋已封，禁止再入")
         scan = conn.execute("SELECT * FROM scans WHERE id=?", (body.扫描编号,)).fetchone()
-        if not scan:
-            raise HTTPException(404, "扫描不存在")
-        if scan["status"] != "已路由":
-            raise HTTPException(400, "仅已路由件可入袋")
-        if scan["chute_id"] != bag["chute_id"]:
-            raise HTTPException(400, "扫描口门与袋口门不一致")
-        conn.execute(
-            "UPDATE scans SET status='已入袋', bag_id=? WHERE id=?",
-            (bag_id, body.扫描编号),
-        )
-        audit(conn, "封袋", bag_id, "入袋", str(body.扫描编号))
-        return row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (body.扫描编号,)).fetchone())
+        if scan and scan["divert_batch_id"] is not None:
+            raise HTTPException(
+                400,
+                "回流后再裁决件禁止写入原袋/常规袋，请使用「回流承接」写口",
+            )
+        return bagging.attach_regular(conn, bag_id, body.扫描编号)
 
 
 @router.post("/封袋/{bag_id}/封口")
 def seal_bag(bag_id: int):
-    with db() as conn:
+    with db(immediate=True) as conn:
         require_unsealed(conn)
-        bag = conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone()
-        if not bag:
-            raise HTTPException(404, "袋不存在")
-        if bag["status"] != "集包中":
-            raise HTTPException(400, "袋状态不可封口")
-        n = conn.execute(
-            "SELECT COUNT(*) c FROM scans WHERE bag_id=?", (bag_id,)
-        ).fetchone()["c"]
-        if n == 0:
-            raise HTTPException(400, "空袋不可封口")
-        conn.execute(
-            "UPDATE bags SET status='已封袋', sealed_at=? WHERE id=?",
-            (now_str(), bag_id),
-        )
-        conn.execute(
-            "UPDATE scans SET status='已封袋' WHERE bag_id=?",
-            (bag_id,),
-        )
-        audit(conn, "封袋", bag_id, "封口", f"件数{n}")
-        return row_to_dict(conn.execute("SELECT * FROM bags WHERE id=?", (bag_id,)).fetchone())
+        return bagging.seal_bag(conn, bag_id)
+
+
+@router.post("/回流承接/入袋")
+def settle_divert(body: BagAddIn):
+    """回流后再裁决 -> 自动新开/复用回流承接袋承接（Arm B 唯一入袋口）。"""
+    with db(immediate=True) as conn:
+        require_unsealed(conn)
+        return bagging.settle_divert(conn, body.扫描编号)
+
+
+@router.get("/扫描/{scan_id}/承接重放")
+def replay_scan_route(scan_id: int):
+    with db() as conn:
+        return bagging.replay_scan(conn, scan_id)

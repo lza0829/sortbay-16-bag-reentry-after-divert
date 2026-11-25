@@ -1,6 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
 from app.db import db, rows_to_list, row_to_dict
 from app.services.common import audit, now_str
 
@@ -10,6 +11,69 @@ router = APIRouter(tags=["班次"])
 class ShiftIn(BaseModel):
     营业日: str = Field(min_length=8)
     班次名: str = Field(min_length=1)
+
+
+def _reconcile(conn, shift) -> dict:
+    sid = shift["id"]
+    scan_n = conn.execute("SELECT COUNT(*) c FROM scans WHERE shift_id=?", (sid,)).fetchone()["c"]
+    routed = conn.execute(
+        """SELECT COUNT(*) c FROM scans WHERE shift_id=?
+           AND status IN ('已路由','已入袋','已封袋')""",
+        (sid,),
+    ).fetchone()["c"]
+    bag_n = conn.execute("SELECT COUNT(*) c FROM bags WHERE shift_id=?", (sid,)).fetchone()["c"]
+    sealed_bag = conn.execute(
+        "SELECT COUNT(*) c FROM bags WHERE shift_id=? AND status='已封袋'", (sid,)
+    ).fetchone()["c"]
+    rebag_n = conn.execute(
+        "SELECT COUNT(*) c FROM bags WHERE shift_id=? AND kind='回流承接'", (sid,)
+    ).fetchone()["c"]
+    sealed_pieces = conn.execute(
+        "SELECT COALESCE(SUM(sealed_count),0) c FROM bags WHERE shift_id=? AND status='已封袋'",
+        (sid,),
+    ).fetchone()["c"]
+    divert_n = conn.execute(
+        "SELECT COUNT(*) c FROM divert_batches WHERE shift_id=?", (sid,)
+    ).fetchone()["c"]
+    divert_open = conn.execute(
+        "SELECT COUNT(*) c FROM divert_batches WHERE shift_id=? AND status='回流中'", (sid,)
+    ).fetchone()["c"]
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('待路由','错分回流')",
+        (sid,),
+    ).fetchone()["c"]
+    # 承接核对：已封袋冻结件数必须等于袋内实际件数（防偷增/偷减）
+    drift = conn.execute(
+        """SELECT b.id, b.sealed_count,
+                  (SELECT COUNT(*) FROM scans s WHERE s.bag_id=b.id) AS actual
+           FROM bags b WHERE b.shift_id=? AND b.status='已封袋'
+             AND b.sealed_count != (SELECT COUNT(*) FROM scans s WHERE s.bag_id=b.id)""",
+        (sid,),
+    ).fetchall()
+    violations = [dict(r) for r in drift]
+    # 回流件不得落在原袋
+    stolen = conn.execute(
+        """SELECT id FROM scans WHERE shift_id=? AND divert_batch_id IS NOT NULL
+             AND bag_id IS NOT NULL AND origin_bag_id IS NOT NULL
+             AND bag_id = origin_bag_id""",
+        (sid,),
+    ).fetchall()
+    for r in stolen:
+        violations.append({"扫描": r["id"], "问题": "回流件写回原袋"})
+    return {
+        "班次": row_to_dict(shift),
+        "扫描总数": scan_n,
+        "已路由及以上": routed,
+        "袋数": bag_n,
+        "已封袋数": sealed_bag,
+        "回流承接袋数": rebag_n,
+        "已封袋件数": sealed_pieces,
+        "回流批次数": divert_n,
+        "回流进行中": divert_open,
+        "未清件数": pending,
+        "违规": violations,
+        "一致": not violations,
+    }
 
 
 @router.get("/班次")
@@ -27,37 +91,12 @@ def reconcile(shift_id: int | None = None):
             shift = conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone()
         if not shift:
             raise HTTPException(404, "班次不存在")
-        sid = shift["id"]
-        scan_n = conn.execute("SELECT COUNT(*) c FROM scans WHERE shift_id=?", (sid,)).fetchone()["c"]
-        routed = conn.execute(
-            "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('已路由','已入袋','已封袋')",
-            (sid,),
-        ).fetchone()["c"]
-        bag_n = conn.execute("SELECT COUNT(*) c FROM bags WHERE shift_id=?", (sid,)).fetchone()["c"]
-        sealed_bag = conn.execute(
-            "SELECT COUNT(*) c FROM bags WHERE shift_id=? AND status='已封袋'", (sid,)
-        ).fetchone()["c"]
-        divert_n = conn.execute(
-            "SELECT COUNT(*) c FROM divert_batches WHERE shift_id=?", (sid,)
-        ).fetchone()["c"]
-        pending = conn.execute(
-            "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('待路由','错分回流')",
-            (sid,),
-        ).fetchone()["c"]
-        return {
-            "班次": row_to_dict(shift),
-            "扫描总数": scan_n,
-            "已路由及以上": routed,
-            "袋数": bag_n,
-            "已封袋数": sealed_bag,
-            "回流批次数": divert_n,
-            "未清件数": pending,
-        }
+        return _reconcile(conn, shift)
 
 
 @router.post("/班次")
 def create_shift(body: ShiftIn):
-    with db() as conn:
+    with db(immediate=True) as conn:
         open_one = conn.execute("SELECT id FROM shifts WHERE sealed=0").fetchone()
         if open_one:
             raise HTTPException(400, "仍有未封班班次，先封班再开新班")
@@ -78,18 +117,33 @@ def create_shift(body: ShiftIn):
 
 @router.post("/班次/{shift_id}/封班")
 def seal_shift(shift_id: int):
-    with db() as conn:
+    with db(immediate=True) as conn:
         shift = conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone()
         if not shift:
             raise HTTPException(404, "班次不存在")
         if shift["sealed"]:
             raise HTTPException(400, "已封班")
         pending = conn.execute(
-            "SELECT COUNT(*) c FROM scans WHERE shift_id=? AND status IN ('待路由','错分回流','已路由','已入袋')",
+            """SELECT COUNT(*) c FROM scans WHERE shift_id=?
+               AND status IN ('待路由','错分回流','已路由','已入袋')""",
             (shift_id,),
         ).fetchone()["c"]
         if pending:
             raise HTTPException(400, f"仍有未封袋/未路由件 {pending}，禁止封班")
+        open_bags = conn.execute(
+            "SELECT COUNT(*) c FROM bags WHERE shift_id=? AND status='集包中'", (shift_id,)
+        ).fetchone()["c"]
+        if open_bags:
+            raise HTTPException(400, f"仍有未封口袋 {open_bags}，禁止封班")
+        open_batches = conn.execute(
+            "SELECT COUNT(*) c FROM divert_batches WHERE shift_id=? AND status='回流中'",
+            (shift_id,),
+        ).fetchone()["c"]
+        if open_batches:
+            raise HTTPException(400, f"仍有进行中回流批次 {open_batches}，禁止封班")
+        rec = _reconcile(conn, shift)
+        if not rec["一致"]:
+            raise HTTPException(400, f"对账不一致，禁止封班: {rec['违规']}")
         conn.execute(
             "UPDATE shifts SET sealed=1, sealed_at=? WHERE id=?",
             (now_str(), shift_id),

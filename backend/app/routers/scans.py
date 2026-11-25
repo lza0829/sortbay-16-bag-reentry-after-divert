@@ -1,6 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
 from app.db import db, rows_to_list, row_to_dict
 from app.services.common import audit, current_shift, now_str, require_unsealed
 
@@ -17,18 +18,25 @@ class ScanIn(BaseModel):
 @router.get("/扫描")
 def list_scans(状态: str | None = None):
     with db() as conn:
+        sql = """
+            SELECT s.*,
+              (SELECT code FROM bags b WHERE b.id=s.bag_id) AS 当前袋码,
+              (SELECT code FROM bags b WHERE b.id=s.origin_bag_id) AS 原袋码,
+              (SELECT code FROM divert_batches d WHERE d.id=s.divert_batch_id) AS 回流批次码
+            FROM scans s
+        """
         if 状态:
             rows = conn.execute(
-                "SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT 200", (状态,)
+                sql + " WHERE s.status=? ORDER BY s.id DESC LIMIT 200", (状态,)
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 200").fetchall()
+            rows = conn.execute(sql + " ORDER BY s.id DESC LIMIT 200").fetchall()
         return rows_to_list(rows)
 
 
 @router.post("/扫描")
 def create_scan(body: ScanIn):
-    with db() as conn:
+    with db(immediate=True) as conn:
         require_unsealed(conn)
         shift = current_shift(conn)
         line = None
@@ -63,7 +71,7 @@ def create_scan(body: ScanIn):
 
 @router.post("/扫描/{scan_id}/路由")
 def route_scan(scan_id: int):
-    with db() as conn:
+    with db(immediate=True) as conn:
         require_unsealed(conn)
         scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
         if not scan:
@@ -82,13 +90,16 @@ def route_scan(scan_id: int):
             raise HTTPException(400, "口门不存在")
         if chute["status"] != "口门开":
             raise HTTPException(400, "口门已闭，禁止落入")
+        redivert = scan["divert_batch_id"] is not None
         conn.execute(
-            "UPDATE scans SET status='已路由', chute_id=? WHERE id=?",
+            "UPDATE scans SET status='已路由', chute_id=?, bag_id=NULL WHERE id=?",
             (chute["id"], scan_id),
         )
+        action = "回流再裁决" if redivert else "路由落入"
         conn.execute(
             "INSERT INTO route_events(scan_id, chute_id, action, created_at, note) VALUES (?, ?, ?, ?, ?)",
-            (scan_id, chute["id"], "路由落入", now_str(), chute["code"]),
+            (scan_id, chute["id"], action, now_str(),
+             chute["code"] + (f";回流批次{scan['divert_batch_id']}" if redivert else "")),
         )
-        audit(conn, "扫描", scan_id, "路由裁决", chute["code"])
+        audit(conn, "扫描", scan_id, action, chute["code"])
         return row_to_dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())

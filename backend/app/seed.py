@@ -6,7 +6,7 @@ from app.db import db, init_db
 
 def seed_if_empty() -> None:
     init_db()
-    with db() as conn:
+    with db(immediate=True) as conn:
         n = conn.execute("SELECT COUNT(*) AS c FROM lines").fetchone()["c"]
         if n:
             return
@@ -49,7 +49,7 @@ def seed_if_empty() -> None:
             )
         conn.execute(
             "INSERT INTO settings(key, value) VALUES (?, ?), (?, ?)",
-            ("口门软容量提示", "120", "回流自动再路由", "否"),
+            ("口门软容量提示", "120", "回流承接策略", "强制新开袋"),
         )
         # 预置一笔待路由扫描，方便冒烟看见分布
         conn.execute(
